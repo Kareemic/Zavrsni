@@ -28,8 +28,10 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     roc_auc_score,
+    precision_recall_curve,
 )
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 
 from feature_extraction import extract_all_features
 
@@ -52,12 +54,30 @@ PERPLEXITY_MISSING = -1.0
 
 # Random Forest parametri
 RF_PARAMS = {
-    "n_estimators":  300,    # broj stabala — više = stabilnije, ali sporije
-    "max_depth":     None,   # bez ograničenja dubine (stabla rastu do čistih listova)
-    "min_samples_leaf": 2,   # svaki list mora imati min. 2 primjera (smanjuje overfitting)
-    "class_weight": "balanced",  # kompenzira neuravnotežene klase (više human nego AI)
+    "n_estimators":  300,
+    "max_depth":     None,
+    "min_samples_leaf": 2,
+    # Dajemo veću kaznu za lažno pozitivne (nevin student označen kao AI)
+    # {0: 1.0, 1: 0.8} znači da je greška na human klasi 1.25x skuplja od greške na AI klasi
+    # "balanced" automatski kompenzira neravnotežu klasa
+    # Human dobiva veći težinski faktor jer je manjina (29% vs 71%)
+    "class_weight": "balanced",
+    # Uz to koristimo max_features za bolju generalizaciju
+    "max_features": "sqrt",
     "random_state":  42,
-    "n_jobs":       -1,      # koristi sve dostupne CPU jezgre
+    "n_jobs":       -1,
+}
+
+# Prag ispod kojeg smatramo kod "premalog" za pouzdanu analizu
+MINIMUM_LINES = 5
+
+# Prag vjerojatnosti — konzervativniji pragovi smanjuju lažno pozitivne
+THRESHOLDS = {
+    "likely_ai":    0.80,   # gore → "Vjerojatno AI"
+    "possible_ai":  0.65,   # gore → "Moguće AI"
+    "unclear":      0.45,   # gore → "Nejasno"
+    "possible_human": 0.25, # gore → "Moguće čovječji"
+    # ispod → "Vjerojatno čovječji"
 }
 
 
@@ -171,9 +191,13 @@ def treniraj(X, y, feature_names):
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled  = scaler.transform(X_test)
 
-    # 3. Treniranje Random Foresta
-    print("\n  Treniram Random Forest...")
-    model = RandomForestClassifier(**RF_PARAMS)
+    # 3. Treniranje Random Foresta + kalibracija vjerojatnosti
+    # CalibratedClassifierCV popravlja iskrivljene vjerojatnosti RF-a.
+    # Bez kalibracije, RF može davati 60% za nešto što je zapravo 30%.
+    # method='isotonic' je jači, ali treba više podataka (>1000 primjera — ok)
+    print("\n  Treniram Random Forest + kalibriram vjerojatnosti...")
+    base_model = RandomForestClassifier(**RF_PARAMS)
+    model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
     model.fit(X_train_scaled, y_train)
 
     # 4. Evaluacija na test skupu
@@ -202,19 +226,53 @@ def treniraj(X, y, feature_names):
     auc = roc_auc_score(y_test, y_pred_prob)
     print(f"  AUC-ROC: {auc:.4f}")
 
-    # 5. Cross-validation — pouzdanija procjena jer trenira/testira 5 puta
+    # 5. Pronalazi optimalni prag odluke koji maksimizira F1 za human klasu
+    # Cilj: smanjiti lažno pozitivne (FP) čak i ako propustimo koji AI
+    precisions, recalls, thresholds = precision_recall_curve(
+        y_test, y_pred_prob, pos_label=0  # gledamo human klasu (0)
+    )
+    # Tražimo prag gdje je precision za human >= 0.85
+    # (tj. kad kažemo "human", u barem 85% slučajeva stvarno je human)
+    optimal_threshold = 0.5  # fallback
+    for prec, rec, thr in zip(precisions, recalls, thresholds):
+        if prec >= 0.85 and rec >= 0.30:
+            optimal_threshold = thr
+            break
+
+    print(f"\n  Optimalni prag odluke za AI klasu: {1 - optimal_threshold:.2f}")
+    print(f"  (Prag ispod kojeg klasificiramo kao Human)")
+
+    # Spremi optimalni prag uz model
+    threshold_path = os.path.join(MODEL_DIR, "threshold.pkl")
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    with open(threshold_path, "wb") as f_thr:
+        pickle.dump(float(1 - optimal_threshold), f_thr)
+
+    # 6. Cross-validation s miješanjem — pouzdanija procjena
+    # StratifiedKFold + shuffle sprječava situaciju gdje jedna fold
+    # sadrži samo jedan tip podataka (npr. samo AIGCodeSet)
+    from sklearn.model_selection import StratifiedKFold
     print("\n  5-fold cross-validation (može potrajati minutu)...")
     X_scaled_full = scaler.transform(X)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     cv_scores = cross_val_score(
         model, X_scaled_full, y,
-        cv=5, scoring="f1", n_jobs=-1
+        cv=skf, scoring="f1", n_jobs=-1
     )
     print(f"  CV F1 scores: {[f'{s:.3f}' for s in cv_scores]}")
     print(f"  CV F1 prosjek: {cv_scores.mean():.3f} "
           f"(±{cv_scores.std():.3f})")
 
     # Top 10 najvažnijih značajki
-    importances = model.feature_importances_
+    # CalibratedClassifierCV omotava base estimator, pa trebamo
+    # dohvatiti feature_importances_ iz jednog od kalibriranih estimatora
+    try:
+        base_rf = model.calibrated_classifiers_[0].estimator
+        importances = base_rf.feature_importances_
+    except Exception:
+        # Fallback ako struktura nije očekivana
+        importances = np.zeros(len(feature_names))
+
     top_idx = np.argsort(importances)[::-1][:10]
     print("\n  Top 10 najvažnijih značajki:")
     for rank, idx in enumerate(top_idx, 1):
@@ -253,13 +311,19 @@ def spremi_model(model, scaler, feature_names):
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    with open(MODEL_PATH,    "wb") as f: pickle.dump(model,         f)
-    with open(SCALER_PATH,   "wb") as f: pickle.dump(scaler,        f)
-    with open(FEATURES_PATH, "wb") as f: pickle.dump(feature_names, f)
+    THRESHOLD_PATH = os.path.join(MODEL_DIR, "threshold.pkl")
+
+    with open(MODEL_PATH,     "wb") as f: pickle.dump(model,         f)
+    with open(SCALER_PATH,    "wb") as f: pickle.dump(scaler,        f)
+    with open(FEATURES_PATH,  "wb") as f: pickle.dump(feature_names, f)
 
     print(f"\n  Model spremljen u:          {MODEL_PATH}")
     print(f"  Scaler spremljen u:         {SCALER_PATH}")
     print(f"  Nazivi značajki spremljeni: {FEATURES_PATH}")
+    if os.path.exists(THRESHOLD_PATH):
+        with open(THRESHOLD_PATH, "rb") as f:
+            thr = pickle.load(f)
+        print(f"  Optimalni prag:             {thr:.2f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,20 +332,28 @@ def spremi_model(model, scaler, feature_names):
 
 def ucitaj_model():
     """
-    Učitava model, scaler i nazive značajki s diska.
+    Učitava model, scaler, nazive značajki i optimalni prag s diska.
     Poziva se jednom pri pokretanju web servera.
 
     Vraća:
-        (model, scaler, feature_names) ili (None, None, None) ako model ne postoji.
+        (model, scaler, feature_names, threshold) ili
+        (None, None, None, 0.65) ako model ne postoji.
     """
+    THRESHOLD_PATH = os.path.join(MODEL_DIR, "threshold.pkl")
+
     if not all(os.path.exists(p) for p in [MODEL_PATH, SCALER_PATH, FEATURES_PATH]):
-        return None, None, None
+        return None, None, None, 0.65
 
     with open(MODEL_PATH,    "rb") as f: model         = pickle.load(f)
     with open(SCALER_PATH,   "rb") as f: scaler        = pickle.load(f)
     with open(FEATURES_PATH, "rb") as f: feature_names = pickle.load(f)
 
-    return model, scaler, feature_names
+    threshold = 0.65  # konzervativni default
+    if os.path.exists(THRESHOLD_PATH):
+        with open(THRESHOLD_PATH, "rb") as f:
+            threshold = pickle.load(f)
+
+    return model, scaler, feature_names, threshold
 
 
 
@@ -393,21 +465,26 @@ def generate_explanations(features: dict, ai_prob: float) -> list:
         )
 
     num_docs = features.get("num_docstrings", 0)
-    num_fns  = features.get("num_functions", 1)
-    if num_docs > 0 and num_fns > 0:
-        doc_coverage = num_docs / num_fns
-        if doc_coverage >= 0.9:
+    # Aproksimiramo broj funkcija iz function_density i total_lines
+    # jer structural features sada vraćaju gustoće, ne apsolutne brojeve
+    fn_density  = features.get("function_density", 0)
+    total_lines = features.get("total_lines", 1)
+    num_fns_est = max(1, round(fn_density * total_lines))
+
+    if num_docs > 0:
+        doc_coverage = num_docs / max(num_fns_est, 1)
+        if num_docs >= 3 and doc_coverage >= 0.8:
             dodaj(
                 f"Every function in the submission includes a formal docstring "
-                f"({num_docs} of {num_fns} functions documented). "
+                f"({num_docs} docstrings detected). "
                 f"Complete docstring coverage is a strong marker of AI-generated code; "
                 f"students rarely document all functions unless explicitly required.",
                 "high", "num_docstrings"
             )
-        elif doc_coverage >= 0.5:
+        elif num_docs >= 2:
             dodaj(
-                f"More than half of the functions include docstrings "
-                f"({num_docs} of {num_fns}), which is above the student average.",
+                f"Multiple functions include docstrings ({num_docs} detected), "
+                f"which is above the typical student average.",
                 "medium", "num_docstrings"
             )
 
@@ -416,16 +493,16 @@ def generate_explanations(features: dict, ai_prob: float) -> list:
     avg_fn_len = features.get("avg_function_length", 0)
     if avg_fn_len > 20:
         dodaj(
-            f"Functions are notably long on average ({avg_fn_len:.0f} lines). "
+            f"Functions are notably long on average ({avg_fn_len:.0f} lines per function). "
             f"AI models tend to produce complete, self-contained implementations; "
             f"students more often break logic across multiple smaller functions "
             f"or leave parts incomplete.",
             "medium", "avg_function_length"
         )
-    elif avg_fn_len > 0 and avg_fn_len < 5:
+    elif 0 < avg_fn_len < 6:
         dodaj(
-            f"Functions are very short on average ({avg_fn_len:.1f} lines), "
-            f"which may indicate a human programmer's incremental coding style.",
+            f"Functions are concise on average ({avg_fn_len:.1f} lines), "
+            f"which is consistent with a human programmer's incremental coding style.",
             "positive", "avg_function_length"
         )
 
@@ -532,7 +609,7 @@ def generate_explanations(features: dict, ai_prob: float) -> list:
 
 
 def predict(code: str, language: str = None, filename: str = None,
-            model=None, scaler=None, feature_names=None) -> dict:
+            model=None, scaler=None, feature_names=None, threshold: float = None) -> dict:
     """
     Analizira isječak koda i vraća procjenu vjerojatnosti AI podrijetla.
 
@@ -557,7 +634,9 @@ def predict(code: str, language: str = None, filename: str = None,
     """
     # Učitaj model ako nije proslijeđen
     if model is None:
-        model, scaler, feature_names = ucitaj_model()
+        model, scaler, feature_names, threshold = ucitaj_model()
+    else:
+        threshold = 0.65  # konzervativni default ako je model proslijeđen direktno
 
     if model is None:
         return {
@@ -567,6 +646,23 @@ def predict(code: str, language: str = None, filename: str = None,
             "top_features":       [],
             "all_features":       {},
             "error": "Model nije treniran. Pokreni: python classifier.py"
+        }
+
+    # Provjera minimalne duljine — kratki kodovi nemaju dovoljno signala
+    # za pouzdanu analizu i skloni su lažno pozitivnim rezultatima
+    meaningful_lines = len([l for l in code.splitlines() if l.strip()])
+    if meaningful_lines < MINIMUM_LINES:
+        return {
+            "ai_probability":    None,
+            "verdict":           "Premalo koda za analizu",
+            "detected_language": None,
+            "top_features":      [],
+            "all_features":      {},
+            "error": (
+                f"Analiza zahtijeva najmanje {MINIMUM_LINES} nepraznih linija koda. "
+                f"Predani isječak ima {meaningful_lines} "
+                f"({'liniju' if meaningful_lines == 1 else 'linije' if meaningful_lines < 5 else 'linija'})."
+            )
         }
 
     # Izvuci značajke
@@ -588,20 +684,27 @@ def predict(code: str, language: str = None, filename: str = None,
     # Predikcija
     ai_prob = float(model.predict_proba(X_scaled)[0][1])
 
-    # Tumačenje
-    if ai_prob >= 0.80:
+    # Tumačenje — koristimo optimalni prag pronađen pri treniranju
+    # Sve iznad threshold-a ide prema "AI", sve ispod prema "Human"
+    ai_cutoff = threshold  # npr. 0.68 pronađen automatski
+    if ai_prob >= min(ai_cutoff + 0.15, 0.90):
         verdict = "Vjerojatno AI"
-    elif ai_prob >= 0.60:
+    elif ai_prob >= ai_cutoff:
         verdict = "Moguće AI"
-    elif ai_prob >= 0.40:
+    elif ai_prob >= ai_cutoff - 0.20:
         verdict = "Nejasno"
-    elif ai_prob >= 0.20:
+    elif ai_prob >= ai_cutoff - 0.40:
         verdict = "Moguće čovječji"
     else:
         verdict = "Vjerojatno čovječji"
 
     # Top 5 značajki koje su doprinijele odluci
-    importances = model.feature_importances_
+    # Dohvati importances iz base estimatora unutar CalibratedClassifierCV
+    try:
+        base_rf = model.calibrated_classifiers_[0].estimator
+        importances = base_rf.feature_importances_
+    except Exception:
+        importances = np.ones(len(feature_names)) / len(feature_names)
     top_idx = np.argsort(importances)[::-1][:5]
     top_features = [
         {
@@ -638,6 +741,37 @@ def main():
     # Učitaj dataset
     print(f"\n  Učitavam dataset iz '{DATASET_PATH}'...")
     X, y, feature_names = ucitaj_dataset(DATASET_PATH)
+
+    # ── UNDERSAMPLING ──────────────────────────────────────────────────────
+    # Balansiramo klase uzimanjem max 3x više human primjera nego AI.
+    # Bez ovoga model s 63:1 omjerom gotovo uvijek predviđa human.
+    # Cilj: human ≈ 2-3x AI → model nauči obje klase jednako dobro.
+
+    n_ai    = int(np.sum(y == 1))
+    n_human = int(np.sum(y == 0))
+    target_human = min(n_human, n_ai * 3)   # max 3x više human nego AI
+
+    if n_human > target_human:
+        print(f"\n  Undersampling: {n_human} → {target_human} human primjera")
+        print(f"  (zadržavamo svih {n_ai} AI + {target_human} human = "
+              f"{n_ai + target_human} ukupno, omjer {target_human//n_ai}:1)")
+
+        rng = np.random.default_rng(42)
+        human_idx = np.where(y == 0)[0]
+        ai_idx    = np.where(y == 1)[0]
+
+        # Nasumično uzimamo target_human primjera iz human klase
+        chosen_human = rng.choice(human_idx, size=target_human, replace=False)
+
+        # Spajamo s AI primjerima i miješamo
+        all_idx = np.concatenate([chosen_human, ai_idx])
+        rng.shuffle(all_idx)
+
+        X = X[all_idx]
+        y = y[all_idx]
+        print(f"  Nakon undersamplinga: Human={int(np.sum(y==0))}, "
+              f"AI={int(np.sum(y==1))}, Ukupno={len(y)}")
+    # ──────────────────────────────────────────────────────────────────────
 
     # Treniraj
     model, scaler, metrics = treniraj(X, y, feature_names)

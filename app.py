@@ -1,3 +1,20 @@
+"""
+app.py
+======
+Flask backend za web aplikaciju za detekciju AI generiranog koda.
+
+Pokretanje:
+    python app.py
+
+API rute:
+    GET  /api/health              — provjera radi li server
+    POST /api/analyze             — analiza jednog isječka koda
+    POST /api/analyze-batch       — analiza više isječaka odjednom
+    POST /api/similarity          — međusobna sličnost više kodova
+
+React frontend šalje zahtjeve na ove rute i prikazuje rezultate.
+"""
+
 import os
 import json
 import difflib
@@ -8,7 +25,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from classifier import predict, ucitaj_model
-from feature_extraction import extract_all_features
+from feature_extraction import extract_all_features, analyze_lines
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -23,7 +40,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # Učitaj model jednom pri pokretanju servera
 # (Ne učitavamo za svaki zahtjev — to bi bilo presporo)
 print("Učitavam model...")
-MODEL, SCALER, FEATURE_NAMES = ucitaj_model()
+MODEL, SCALER, FEATURE_NAMES, THRESHOLD = ucitaj_model()
 
 if MODEL is None:
     print("UPOZORENJE: Model nije pronađen.")
@@ -42,6 +59,16 @@ def greska(poruka: str, status: int = 400):
 
 
 def izracunaj_slicnost(kod_a: str, kod_b: str) -> float:
+    """
+    Računa sličnost između dva isječka koda kao broj između 0.0 i 1.0.
+
+    Koristi SequenceMatcher koji gleda zajednične podnizove.
+    0.0 = potpuno različiti kodovi
+    1.0 = identični kodovi
+
+    Ovo je korisno za otkrivanje je li više studenata koristilo isti AI prompt —
+    tada će njihovi kodovi biti međusobno neobično slični.
+    """
     return difflib.SequenceMatcher(None, kod_a.strip(), kod_b.strip()).ratio()
 
 
@@ -68,6 +95,7 @@ def health():
         "status":        "ok",
         "model_loaded":  MODEL is not None,
         "feature_count": len(FEATURE_NAMES) if FEATURE_NAMES else 0,
+        "threshold":     round(THRESHOLD, 3) if THRESHOLD else 0.65,
     })
 
 
@@ -117,6 +145,14 @@ def analyze():
         model=MODEL,
         scaler=SCALER,
         feature_names=FEATURE_NAMES,
+        threshold=THRESHOLD,
+    )
+
+    # Dodaj anotacije sumnjivih linija za prikaz u code editoru
+    rezultat["line_annotations"] = analyze_lines(
+        code=kod,
+        language=jezik,
+        filename=datoteka,
     )
 
     return jsonify(rezultat)
@@ -124,7 +160,19 @@ def analyze():
 
 @app.route("/api/analyze-batch", methods=["POST"])
 def analyze_batch():
-   
+    """
+    Analizira više isječaka koda — streaming verzija.
+
+    Umjesto da čeka sve rezultate pa ih pošalje odjednom (što uzrokuje
+    timeout kod velikog broja fajlova), šalje svaki rezultat čim je gotov
+    kao Server-Sent Events (SSE) stream.
+
+    Frontend čita stream liniju po liniju i ažurira UI u realnom vremenu.
+
+    Format streama — svaka linija je JSON objekt jedne od ove dvije vrste:
+        {"type": "result", "data": { ...rezultat za jedan fajl... }}
+        {"type": "summary", "data": { ...ukupna statistika... }}
+    """
     podaci = request.get_json(silent=True)
     if not podaci:
         return greska("Zahtjev mora sadržavati JSON tijelo.")
@@ -133,54 +181,108 @@ def analyze_batch():
     if not submissions:
         return greska("Polje 'submissions' je prazno.")
 
-    if len(submissions) > 200:
-        return greska("Maksimalno 200 kodova po zahtjevu.")
+    def generate():
+        rezultati = []
 
-    rezultati = []
-    for sub in submissions:
-        sub_id  = sub.get("id", "nepoznat")
-        kod     = sub.get("code", "").strip()
-        jezik   = sub.get("language")
-        datoteka = sub.get("filename")
+        for sub in submissions:
+            sub_id   = sub.get("id", "nepoznat")
+            kod      = sub.get("code", "").strip()
+            jezik    = sub.get("language")
+            datoteka = sub.get("filename")
 
-        if not kod:
-            rezultati.append({
-                "id":    sub_id,
-                "error": "Prazni kod."
-            })
-            continue
+            if not kod:
+                rez = {"id": sub_id, "error": "Prazni kod."}
+            else:
+                try:
+                    rez = predict(
+                        code=kod,
+                        language=jezik,
+                        filename=datoteka,
+                        model=MODEL,
+                        scaler=SCALER,
+                        feature_names=FEATURE_NAMES,
+                        threshold=THRESHOLD,
+                    )
+                    rez["id"] = sub_id
+                    rez["line_annotations"] = analyze_lines(
+                        code=kod,
+                        language=jezik,
+                        filename=datoteka,
+                    )
+                except Exception as e:
+                    rez = {"id": sub_id, "error": str(e)}
 
-        rez = predict(
-            code=kod,
-            language=jezik,
-            filename=datoteka,
-            model=MODEL,
-            scaler=SCALER,
-            feature_names=FEATURE_NAMES,
-        )
-        rez["id"] = sub_id
-        rezultati.append(rez)
+            rezultati.append(rez)
 
-    # Sažetak za tablični prikaz
-    probs = [
-        r["ai_probability"]
-        for r in rezultati
-        if r.get("ai_probability") is not None
-    ]
+            # Pošalji rezultat odmah — ne čekamo ostale
+            yield json.dumps({"type": "result", "data": rez},
+                             ensure_ascii=False) + "\n"
 
-    summary = {
-        "total":    len(rezultati),
-        "high_risk":   sum(1 for p in probs if p >= 0.70),
-        "medium_risk": sum(1 for p in probs if 0.40 <= p < 0.70),
-        "low_risk":    sum(1 for p in probs if p < 0.40),
-        "avg_ai_probability": round(sum(probs) / len(probs), 4) if probs else 0.0,
-    }
+        # Na kraju pošalji summary
+        probs = [
+            r["ai_probability"]
+            for r in rezultati
+            if r.get("ai_probability") is not None
+        ]
+        summary = {
+            "total":             len(rezultati),
+            "high_risk":         sum(1 for p in probs if p >= 0.70),
+            "medium_risk":       sum(1 for p in probs if 0.40 <= p < 0.70),
+            "low_risk":          sum(1 for p in probs if p < 0.40),
+            "avg_ai_probability": round(sum(probs) / len(probs), 4) if probs else 0.0,
+        }
+        yield json.dumps({"type": "summary", "data": summary},
+                         ensure_ascii=False) + "\n"
 
-    return jsonify({"results": rezultati, "summary": summary})
+    from flask import stream_with_context
+    return app.response_class(
+        stream_with_context(generate()),
+        mimetype="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",      # isključi nginx buffering ako postoji
+            "Cache-Control":     "no-cache",
+        }
+    )
 
 
 @app.route("/api/similarity", methods=["POST"])
 def similarity():
+    """
+    Računa međusobnu sličnost između više kodova i vraća matricu sličnosti.
+
+    Ovo otkriva je li više studenata predalo gotovo identičan kod
+    — što sugerira korištenje istog AI prompta.
+
+    Zahtjev (JSON):
+        {
+            "submissions": [
+                {"id": "student_01", "code": "..."},
+                {"id": "student_02", "code": "..."},
+                ...
+            ]
+        }
+
+    Odgovor (JSON):
+        {
+            "ids": ["student_01", "student_02", ...],
+            "matrix": [
+                [1.00, 0.87, 0.12, ...],   ← sličnost student_01 s ostalima
+                [0.87, 1.00, 0.15, ...],
+                ...
+            ],
+            "suspicious_pairs": [
+                {
+                    "id_a":       "student_01",
+                    "id_b":       "student_02",
+                    "similarity": 0.87
+                },
+                ...
+            ]
+        }
+
+    suspicious_pairs sadrži sve parove sa sličnošću > 0.70
+    (konfigurabilno, trenutno 70%).
+    """
     podaci = request.get_json(silent=True)
     if not podaci:
         return greska("Zahtjev mora sadržavati JSON tijelo.")
@@ -188,9 +290,6 @@ def similarity():
     submissions = podaci.get("submissions", [])
     if len(submissions) < 2:
         return greska("Potrebna su najmanje 2 koda za usporedbu.")
-
-    if len(submissions) > 100:
-        return greska("Maksimalno 100 kodova po zahtjevu.")
 
     ids   = [s.get("id", f"kod_{i}") for i, s in enumerate(submissions)]
     codes = [s.get("code", "") for s in submissions]
@@ -248,5 +347,6 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=5000,
-        debug=True,    
+        debug=True,
+        threaded=True,   # potrebno za streaming — svaki zahtjev u svom threadu
     )

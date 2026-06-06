@@ -623,3 +623,185 @@ public class Calculator {
                 print(f"  {display_name:<32} {val}")
 
     print(f"\n  Ukupno značajki: {len(features)}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALIZA PO LINIJAMA — za prikaz sumnjivih linija u UI-u
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analyze_lines(code: str, language: str = None, filename: str = None) -> list:
+    """
+    Analizira kod liniju po liniju i vraća listu sumnjivih linija.
+
+    Svaki element liste je rječnik:
+        {
+            "line":  int,   # broj linije (1-based)
+            "tone":  str,   # "red" = jak signal, "amber" = umjeren
+            "note":  str,   # kratko objašnjenje (prikazuje se u UI-u)
+        }
+
+    Detektira sljedeće AI signale po liniji:
+      - Docstringovi i formalni blok komentari (jak signal)
+      - Jednolinijski komentari (umjeren signal)
+      - Linije s dugačkim identifikatorima (umjeren signal)
+      - Type anotacije (umjeren signal)
+      - Try/except/raise/throw s formalnim porukama (umjeren signal)
+      - Linije s višestrukim opisnim identifikatorima (jak signal)
+
+    Parametri:
+        code (str):          Izvorni kod kao string.
+        language (str|None): Naziv jezika — ako None, automatski se detektira.
+        filename (str|None): Ime datoteke — pomaže detekciji jezika.
+
+    Vraća:
+        list: Lista rječnika s anotacijama, sortirana po broju linije.
+    """
+    import re
+
+    if language is None:
+        if filename is not None:
+            language = detect_language_from_extension(filename) or detect_language_from_code(code)
+        else:
+            language = detect_language_from_code(code)
+
+    try:
+        lang_config = get_config(language)
+    except ValueError:
+        lang_config = get_config("python")
+
+    lines = code.splitlines()
+    annotations = []
+    in_docstring = False
+    docstring_char = None
+
+    inline_pat = lang_config.get("inline_comment", r"^\s*#")
+
+    for i, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # ── DOCSTRINGOVI / BLOK KOMENTARI ─────────────────────────────────
+        # Python docstringovi (""" ili ''')
+        if language == "python":
+            triple_count = stripped.count('"""') + stripped.count("'''")
+            if not in_docstring and ('"""' in stripped or "'''" in stripped):
+                docstring_char = '"""' if '"""' in stripped else "'''"
+                # Ako se otvara i zatvara na istoj liniji → jednolinijski docstring
+                if stripped.count(docstring_char) >= 2 and len(stripped) > 6:
+                    annotations.append({
+                        "line": i, "tone": "red",
+                        "note": "Formal docstring — strong AI indicator"
+                    })
+                else:
+                    in_docstring = True
+                    annotations.append({
+                        "line": i, "tone": "red",
+                        "note": "Docstring block — strong AI indicator"
+                    })
+                continue
+            elif in_docstring:
+                annotations.append({
+                    "line": i, "tone": "red",
+                    "note": "Docstring content"
+                })
+                if docstring_char and docstring_char in stripped:
+                    in_docstring = False
+                continue
+
+        # Javadoc / JSDoc blokovi (/** ... */)
+        if language in ("java", "javascript", "typescript", "cpp", "c"):
+            if stripped.startswith("/**") or stripped.startswith("* ") or stripped == "*/":
+                annotations.append({
+                    "line": i, "tone": "red",
+                    "note": "Formal documentation comment — strong AI indicator"
+                })
+                continue
+
+        # ── JEDNOLINIJSKI KOMENTARI ────────────────────────────────────────
+        if re.match(inline_pat, line):
+            # Gledamo duljinu komentara — kratki (#) ne flagiramo
+            comment_text = re.sub(inline_pat, "", line).strip()
+            word_count = len(comment_text.split())
+            if word_count >= 4:
+                annotations.append({
+                    "line": i, "tone": "amber",
+                    "note": f"Inline comment ({word_count} words) — elevated comment density"
+                })
+            continue
+
+        # ── DUGAČKI IDENTIFIKATORI ─────────────────────────────────────────
+        # VAŽNO: Prije analize, uklonimo sadržaj string literala s linije.
+        # Bez ovoga, regex bi uhvatio i prirodne riječi unutar stringova
+        # (npr. "Ucitajte red matrice") kao identifikatore — što je pogrešno.
+        code_only = re.sub(r'"[^"]*"', '""', stripped)   # ukloni "..."
+        code_only = re.sub(r"'[^']*'", "''", code_only)  # ukloni '...'
+        code_only = re.sub(r"`[^`]*`", "``", code_only)       # ukloni `...`
+
+        identifiers = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]{4,})\b', code_only)
+
+        # Preskačemo rezervirane riječi i uobičajene kratke stdlib nazive
+        reserved = {
+            "return", "import", "function", "class", "interface", "public",
+            "private", "static", "const", "false", "true", "none", "self",
+            "print", "printf", "scanf", "range", "raise", "while", "break",
+            "continue", "yield", "lambda", "assert", "except", "finally",
+            "include", "define", "string", "vector", "struct", "unsigned",
+            "length", "value", "write", "reads", "fopen", "fclose", "malloc",
+            "sizeof", "stdio", "stdlib", "nullptr", "virtual", "override",
+            "inline", "extern", "register", "volatile", "switch", "default",
+        }
+        real_ids = [x for x in identifiers if x.lower() not in reserved]
+
+        if len(real_ids) >= 2:
+            avg_len = sum(len(x) for x in real_ids) / len(real_ids)
+            if avg_len >= 9:
+                annotations.append({
+                    "line": i, "tone": "red",
+                    "note": f"Very long identifiers (avg {avg_len:.0f} chars) — AI naming pattern"
+                })
+                continue
+            elif avg_len >= 7:
+                annotations.append({
+                    "line": i, "tone": "amber",
+                    "note": f"Descriptive identifier names (avg {avg_len:.0f} chars)"
+                })
+                continue
+
+        # ── TYPE ANOTACIJE (Python) ────────────────────────────────────────
+        if language == "python":
+            if re.search(r'\)\s*->\s*\w', stripped) or re.search(r':\s*(int|float|str|bool|list|dict|tuple|set|Optional|Union|List|Dict)\b', stripped):
+                annotations.append({
+                    "line": i, "tone": "amber",
+                    "note": "Type annotation — uncommon in student code"
+                })
+                continue
+
+        # ── TRY/EXCEPT/RAISE S PORUKAMA ────────────────────────────────────
+        if re.match(r'^\s*(raise|throw)\s+\w*Error\s*\(', line) or \
+           re.match(r'^\s*(raise|throw)\s+\w*Exception\s*\(', line):
+            annotations.append({
+                "line": i, "tone": "amber",
+                "note": "Explicit exception with message — AI error handling pattern"
+            })
+            continue
+
+        if re.match(r'^\s*(except|catch)\s*[\(\w]', line):
+            annotations.append({
+                "line": i, "tone": "amber",
+                "note": "Exception handling — AI code often handles all edge cases"
+            })
+            continue
+
+    # Makni previše sumnjivih linija — ako je >60% flagirano, to gubi smisao
+    # Prikaži samo najsumnjivije linije (max 40% koda)
+    total_nonblank = sum(1 for l in lines if l.strip())
+    max_annotations = max(3, int(total_nonblank * 0.40))
+
+    # Sortiraj: red prije amber, onda po broju linije
+    priority = {"red": 0, "amber": 1}
+    annotations.sort(key=lambda a: (priority.get(a["tone"], 2), a["line"]))
+    annotations = annotations[:max_annotations]
+    annotations.sort(key=lambda a: a["line"])
+
+    return annotations

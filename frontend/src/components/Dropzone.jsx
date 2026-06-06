@@ -27,7 +27,7 @@ export default function Dropzone({ files = [], onUpload }) {
         {files.length > 0 ? `${files.length} files ready to analyze` : 'Drop student files here or click to upload'}
       </div>
       <div style={{ fontSize: 13, color: '#64748B' }}>
-        Accepts <span style={{ fontFamily: 'JetBrains Mono, monospace', color: '#94A3B8' }}>.py .js .java .cpp .ts .go .rs</span> · max 200 files
+        Accepts <span style={{ fontFamily: 'JetBrains Mono, monospace', color: '#94A3B8' }}>.py .js .java .cpp .ts .go .rs .c .h</span>
       </div>
       {files.length > 0 && (
         <div style={{ marginTop: 20, display: 'flex', justifyContent: 'center', gap: 6, flexWrap: 'wrap', maxWidth: 600, marginLeft: 'auto', marginRight: 'auto' }}>

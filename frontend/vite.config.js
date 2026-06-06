@@ -9,6 +9,8 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:5000',
         changeOrigin: true,
+        proxyTimeout: 600000,   // 10 minuta — za batch od 1000+ fajlova
+        timeout:      600000,   // isto za socket timeout
       }
     }
   }

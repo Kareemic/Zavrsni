@@ -32,13 +32,16 @@ function buildFeatures(allFeatures) {
   ].filter(Boolean)
 }
 
-function buildAnnotations(topFeatures) {
-  if (!topFeatures?.length) return []
-  return topFeatures.slice(0, 2).map((f, i) => ({
-    line: (i + 1) * 2,
-    tone: f.importance > 0.06 ? 'red' : 'amber',
-    note: `Suspicious: ${f.name.replace(/_/g, ' ')}`,
-  }))
+// Anotacije sada dolaze direktno s backenda (analyze_lines funkcija)
+// Backend analizira svaku liniju i detektira konkretne AI signale:
+//   "red"   = jak signal (docstringovi, dugački identifikatori)
+//   "amber" = umjeren signal (komentari, type anotacije, exception handling)
+function buildAnnotations(row) {
+  if (row?.line_annotations?.length) {
+    return row.line_annotations
+  }
+  // Fallback: ako nema backendskih anotacija (stariji model), vraćamo prazno
+  return []
 }
 
 export default function DetailScreen({ row, onBack }) {
@@ -51,7 +54,7 @@ export default function DetailScreen({ row, onBack }) {
   const langDisplay = lang.charAt(0).toUpperCase() + lang.slice(1)
 
   const features = buildFeatures(row.all_features)
-  const annotations = buildAnnotations(row.top_features)
+  const annotations = buildAnnotations(row)
   const code = row.code || '// Code not available'
 
   return (

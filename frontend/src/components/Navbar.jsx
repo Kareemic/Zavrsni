@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { Button } from './primitives'
 
 function NavLink({ active, onClick, children }) {
   const [hover, setHover] = useState(false)
@@ -37,6 +36,7 @@ export default function Navbar({ active, onNavigate }) {
         padding: '0 80px',
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       }}>
+        {/* Logo */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}
           onClick={() => onNavigate('analyze')}>
           <svg width="28" height="28" viewBox="0 0 32 32" fill="none">
@@ -47,6 +47,8 @@ export default function Navbar({ active, onNavigate }) {
             Code<span style={{ color: '#00D4FF' }}>Sentinel</span>
           </div>
         </div>
+
+        {/* Nav links */}
         <nav style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           {tabs.map(t => (
             <NavLink key={t.id} active={active === t.id} onClick={() => onNavigate(t.id)}>
@@ -54,14 +56,9 @@ export default function Navbar({ active, onNavigate }) {
             </NavLink>
           ))}
         </nav>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{
-            width: 32, height: 32, borderRadius: '50%',
-            background: 'linear-gradient(135deg, #00D4FF, #06B6D4)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            color: '#0A0F1C', fontWeight: 700, fontSize: 12,
-          }}>CS</div>
-        </div>
+
+        {/* Desna strana — prazna, CS avatar uklonjen */}
+        <div style={{ width: 44 }}/>
       </div>
     </header>
   )

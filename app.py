@@ -21,7 +21,7 @@ import difflib
 import warnings
 warnings.filterwarnings("ignore")
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 from classifier import predict, ucitaj_model
@@ -33,6 +33,9 @@ from feature_extraction import extract_all_features, analyze_lines
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
+
+# Putanja do buildan React aplikacije (postoji samo u produkciji)
+FRONTEND_BUILD = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 
 # CORS dopušta React frontendu (localhost:3000) da komunicira s ovim serverom
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -328,14 +331,30 @@ def similarity():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POKRETANJE
+# SERVIRANJE REACT FRONTENDA (produkcija)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    """
+    Servira buildan React app za sve rute koje nisu /api/*.
+    Potrebno za client-side routing (React Router).
+    """
+    if os.path.isdir(FRONTEND_BUILD):
+        target = os.path.join(FRONTEND_BUILD, path)
+        if path and os.path.exists(target):
+            return send_from_directory(FRONTEND_BUILD, path)
+        return send_from_directory(FRONTEND_BUILD, "index.html")
+    return jsonify({"error": "Frontend nije buildан. Pokreni: cd frontend && npm run build"}), 404
+
+
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
     print("\n" + "=" * 50)
     print("  AI Code Detector — Backend")
     print("=" * 50)
-    print("  Server pokrenut na: http://localhost:5000")
+    print(f"  Server pokrenut na: http://localhost:{port}")
     print("  API rute:")
     print("    GET  /api/health")
     print("    POST /api/analyze")
@@ -343,10 +362,4 @@ if __name__ == "__main__":
     print("    POST /api/similarity")
     print("\n  Zaustavi server s Ctrl+C")
     print("=" * 50 + "\n")
-
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=True,
-        threaded=True,   # potrebno za streaming — svaki zahtjev u svom threadu
-    )
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

@@ -191,7 +191,7 @@ def analyze_batch():
             sub_id   = sub.get("id", "nepoznat")
             kod      = sub.get("code", "").strip()
             jezik    = sub.get("language")
-            datoteka = sub.get("filename")
+            datoteka = sub.get("filename") or sub.get("file")
 
             if not kod:
                 rez = {"id": sub_id, "error": "Prazni kod."}

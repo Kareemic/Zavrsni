@@ -568,22 +568,157 @@ def generate_explanations(features: dict, ai_prob: float) -> list:
 
     # ── FORMATIRANJE ───────────────────────────────────────────────────────
 
+    # ── FORMATIRANJE I CISTOCA KODA ────────────────────────────────────────
+
     trailing = features.get("trailing_whitespace_ratio", 0)
     if trailing > 0.15:
         dodaj(
             f"A notable proportion of lines contain trailing whitespace "
-            f"({trailing * 100:.0f}%), which is typical of code edited by hand "
-            f"and inconsistent with AI-generated output.",
+            f"({trailing * 100:.0f}%), which is typical of code edited by hand.",
             "positive", "trailing_whitespace_ratio"
+        )
+    elif trailing == 0.0:
+        # JAK SIGNAL: NIJEDAN trailing whitespace - AI generira savrseno cisto
+        dodaj(
+            f"The code contains zero trailing whitespace across all lines. "
+            f"Hand-edited code almost always contains some accidental trailing spaces; "
+            f"a perfectly clean state is a strong indicator of programmatic generation.",
+            "high", "trailing_whitespace_ratio"
+        )
+    elif trailing < 0.02:
+        dodaj(
+            f"Trailing whitespace is unusually rare ({trailing * 100:.1f}%). "
+            f"Human-written code typically contains some accidental whitespace.",
+            "medium", "trailing_whitespace_ratio"
         )
 
     op_cons = features.get("operator_spacing_consistency", 0)
-    if op_cons > 0.95:
+    if op_cons >= 0.98:
         dodaj(
-            f"Spacing around operators is perfectly consistent throughout the submission. "
-            f"AI models apply style conventions uniformly; human programmers "
-            f"occasionally deviate, particularly under time pressure.",
+            f"Spacing around operators is perfectly consistent throughout the submission "
+            f"({op_cons * 100:.0f}%). AI models apply style conventions uniformly; "
+            f"human programmers occasionally deviate, especially under time pressure.",
+            "high", "operator_spacing_consistency"
+        )
+    elif op_cons > 0.90:
+        dodaj(
+            f"Operator spacing is highly consistent ({op_cons * 100:.0f}%).",
             "medium", "operator_spacing_consistency"
+        )
+
+    empty_ratio = features.get("empty_line_ratio", 0)
+    if 0.05 <= empty_ratio <= 0.20:
+        dodaj(
+            f"The code uses well-spaced empty lines ({empty_ratio * 100:.0f}%) "
+            f"to separate logical blocks. AI tends to apply this pattern systematically.",
+            "medium", "empty_line_ratio"
+        )
+
+    # ── DUZINA LINIJA ──────────────────────────────────────────────────────
+
+    avg_line = features.get("avg_line_length", 0)
+    if avg_line > 60:
+        dodaj(
+            f"Lines are notably long on average ({avg_line:.0f} characters). "
+            f"AI models often produce dense, single-line expressions; "
+            f"human code tends to break logic across multiple shorter lines.",
+            "high", "avg_line_length"
+        )
+    elif avg_line > 40:
+        dodaj(
+            f"Average line length ({avg_line:.0f} characters) is moderately high.",
+            "medium", "avg_line_length"
+        )
+
+    max_line = features.get("max_line_length", 0)
+    if max_line > 100:
+        dodaj(
+            f"One or more lines exceed {max_line:.0f} characters. "
+            f"Very long single lines are common in AI-generated code "
+            f"which prioritizes correctness over readability.",
+            "medium", "max_line_length"
+        )
+
+    # ── STRUKTURNI OBRASCI ─────────────────────────────────────────────────
+
+    for_d = features.get("for_density", 0)
+    if_d  = features.get("if_density", 0)
+    total_branch_density = for_d + if_d + features.get("while_density", 0)
+
+    if for_d > 0.08:
+        dodaj(
+            f"The code contains a high density of for-loops "
+            f"({for_d * 100:.1f}% of lines). AI generators tend to express logic "
+            f"through explicit iteration even when alternatives exist.",
+            "medium", "for_density"
+        )
+
+    if total_branch_density > 0.25:
+        dodaj(
+            f"Branching constructs (if/for/while) account for "
+            f"{total_branch_density * 100:.0f}% of lines. AI-generated code "
+            f"frequently exhibits dense control flow with explicit handling of every case.",
+            "high", "control_flow_density"
+        )
+
+    # ── AST STRUKTURA ──────────────────────────────────────────────────────
+
+    ast_depth = features.get("ast_depth", 0)
+    if ast_depth >= 10:
+        dodaj(
+            f"Abstract syntax tree depth reaches {int(ast_depth)} levels. "
+            f"AI tends to construct deeply nested expressions and produce "
+            f"more uniformly structured code than student submissions.",
+            "medium", "ast_depth"
+        )
+
+    ast_per_line = features.get("ast_nodes_per_line", 0)
+    if ast_per_line > 8:
+        dodaj(
+            f"The code contains {ast_per_line:.1f} AST nodes per line on average, "
+            f"indicating dense and complex expressions per statement — "
+            f"a pattern typical of AI-generated solutions.",
+            "medium", "ast_nodes_per_line"
+        )
+
+    unique_nodes = features.get("unique_node_type_ratio", 0)
+    if unique_nodes < 0.30:
+        dodaj(
+            f"Only {unique_nodes * 100:.0f}% of AST node types are unique — "
+            f"the code reuses the same structural patterns repeatedly. "
+            f"AI-generated code often has lower structural diversity.",
+            "medium", "unique_node_type_ratio"
+        )
+
+    # ── DUZINA IDENTIFIKATORA — DODATNE RAZINE ────────────────────────────
+
+    # Moderate avg_identifier_length (4.5 - 5.5) signaliziraju umjereno opisno imenovanje
+    if 4.5 <= avg_id_len < 5.5:
+        dodaj(
+            f"Identifier names average {avg_id_len:.1f} characters — "
+            f"moderately descriptive, more verbose than typical student shorthand "
+            f"but less so than fully AI-generated names.",
+            "medium", "avg_identifier_length"
+        )
+
+    fn_name_len = features.get("avg_function_name_length", 0)
+    if fn_name_len >= 15:
+        dodaj(
+            f"Function names average {fn_name_len:.0f} characters. "
+            f"Verbose function naming (e.g. 'calculate_average_value') is a strong "
+            f"marker of AI generation; students typically choose much shorter names.",
+            "high", "avg_function_name_length"
+        )
+
+    # ── LEKSICKA RAZNOLIKOST ──────────────────────────────────────────────
+
+    lex_div = features.get("lexical_diversity", 0)
+    if lex_div < 0.40 and lex_div > 0:
+        dodaj(
+            f"Lexical diversity is low ({lex_div:.2f}) — the code reuses "
+            f"the same vocabulary repeatedly. AI tends toward repetitive, "
+            f"templated phrasing across the codebase.",
+            "medium", "lexical_diversity"
         )
 
     # Ako nema signala, dodaj neutralnu poruku
